@@ -43,8 +43,27 @@
 #define HYSTART_DELAY_MAX	(16U<<3)
 #define HYSTART_DELAY_THRESH(x)	clamp(x, HYSTART_DELAY_MIN, HYSTART_DELAY_MAX)
 
+#define UDBG printk(KERN_DEFAULT "DBG:%s:%s:%d\n", __FILE__, __func__, __LINE__)
+
+#undef XDEBUG
+#ifdef XDEBUG
+#define INFO(fmt, ...) \
+	pr_info("[%s:%d] " fmt "\n", __func__, __LINE__,\
+		##__VA_ARGS__)
+#else
+#define INFO(fmt, ...) \
+	pr_info(fmt "\n", ##__VA_ARGS__)
+#endif
+
+static int zero = 0;
+static int beta_max = BICTCP_BETA_SCALE - 1;
+static int n_max = 10;
+struct ctl_table_header *ctl_hdr;
+
 static int fast_convergence __read_mostly = 1;
 static int beta __read_mostly = 717;	/* = 717/1024 (BICTCP_BETA_SCALE) */
+static int beta_n_conn __read_mostly = 1;
+static int beta_effective __read_mostly;	/* = 1024 - (1024 - beta)/n */
 static int initial_ssthresh __read_mostly;
 static int bic_scale __read_mostly = 41;
 static int tcp_friendliness __read_mostly = 1;
@@ -105,6 +124,7 @@ struct bictcp {
 
 static inline void bictcp_reset(struct bictcp *ca)
 {
+	UDBG;
 	ca->cnt = 0;
 	ca->last_max_cwnd = 0;
 	ca->last_cwnd = 0;
@@ -132,6 +152,7 @@ static inline void bictcp_hystart_reset(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct bictcp *ca = inet_csk_ca(sk);
+	UDBG;
 
 	ca->round_start = ca->last_ack = bictcp_clock();
 	ca->end_seq = tp->snd_nxt;
@@ -142,6 +163,7 @@ static inline void bictcp_hystart_reset(struct sock *sk)
 static void bictcp_init(struct sock *sk)
 {
 	struct bictcp *ca = inet_csk_ca(sk);
+	UDBG;
 
 	bictcp_reset(ca);
 	ca->loss_cwnd = 0;
@@ -208,6 +230,7 @@ static inline void bictcp_update(struct bictcp *ca, u32 cwnd)
 {
 	u32 delta, bic_target, max_cnt;
 	u64 offs, t;
+	// UDBG;
 
 	ca->ack_cnt++;	/* count the number of ACKs */
 
@@ -312,13 +335,16 @@ static void bictcp_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 	if (!tcp_is_cwnd_limited(sk))
 		return;
 
+	INFO("snd_cwnd: (%d), ssthresh: [%d]", tp->snd_cwnd, tp->snd_ssthresh);
 	if (tp->snd_cwnd <= tp->snd_ssthresh) {
 		if (hystart && after(ack, ca->end_seq))
 			bictcp_hystart_reset(sk);
 		tcp_slow_start(tp, acked);
+		INFO("after slow_start (%d)", tp->snd_cwnd);
 	} else {
 		bictcp_update(ca, tp->snd_cwnd);
 		tcp_cong_avoid_ai(tp, ca->cnt);
+		INFO("after cong_avoid_ai (%d)", tp->snd_cwnd);
 	}
 
 }
@@ -327,19 +353,22 @@ static u32 bictcp_recalc_ssthresh(struct sock *sk)
 {
 	const struct tcp_sock *tp = tcp_sk(sk);
 	struct bictcp *ca = inet_csk_ca(sk);
+	UDBG;
 
 	ca->epoch_start = 0;	/* end of epoch */
 
 	/* Wmax and fast convergence */
 	if (tp->snd_cwnd < ca->last_max_cwnd && fast_convergence)
-		ca->last_max_cwnd = (tp->snd_cwnd * (BICTCP_BETA_SCALE + beta))
-			/ (2 * BICTCP_BETA_SCALE);
+		ca->last_max_cwnd =
+		    (tp->snd_cwnd * (BICTCP_BETA_SCALE + beta_effective)) /
+		    (2 * BICTCP_BETA_SCALE);
 	else
 		ca->last_max_cwnd = tp->snd_cwnd;
 
 	ca->loss_cwnd = tp->snd_cwnd;
 
-	return max((tp->snd_cwnd * beta) / BICTCP_BETA_SCALE, 2U);
+	INFO("new ssthresh: [%d]", max((tp->snd_cwnd * beta_effective) / BICTCP_BETA_SCALE, 2U));
+	return max((tp->snd_cwnd * beta_effective) / BICTCP_BETA_SCALE, 2U);
 }
 
 static u32 bictcp_undo_cwnd(struct sock *sk)
@@ -351,6 +380,7 @@ static u32 bictcp_undo_cwnd(struct sock *sk)
 
 static void bictcp_state(struct sock *sk, u8 new_state)
 {
+	INFO("tcp state: %d", new_state);
 	if (new_state == TCP_CA_Loss) {
 		bictcp_reset(inet_csk_ca(sk));
 		bictcp_hystart_reset(sk);
@@ -361,6 +391,7 @@ static void hystart_update(struct sock *sk, u32 delay)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct bictcp *ca = inet_csk_ca(sk);
+	UDBG;
 
 	if (!(ca->found & hystart_detect)) {
 		u32 now = bictcp_clock();
@@ -401,6 +432,7 @@ static void bictcp_acked(struct sock *sk, u32 cnt, s32 rtt_us)
 	const struct tcp_sock *tp = tcp_sk(sk);
 	struct bictcp *ca = inet_csk_ca(sk);
 	u32 delay;
+	// UDBG;
 
 	if (icsk->icsk_ca_state == TCP_CA_Open) {
 		u32 ratio = ca->delayed_ack;
@@ -433,7 +465,51 @@ static void bictcp_acked(struct sock *sk, u32 cnt, s32 rtt_us)
 		hystart_update(sk, delay);
 }
 
-static struct tcp_congestion_ops cubictcp __read_mostly = {
+/* Return 0 on success */
+static int proc_modify_beta(struct ctl_table *table, int write,
+		void __user *buffer, size_t *lenp, loff_t *ppos)
+{
+	int err = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
+	if (err)
+		return err;
+
+	beta_effective =
+	    BICTCP_BETA_SCALE - (BICTCP_BETA_SCALE - beta) / beta_n_conn;
+
+	beta_scale = 8 * (BICTCP_BETA_SCALE + beta_effective) / 3 /
+		     (BICTCP_BETA_SCALE - beta_effective);
+
+	INFO("beta/n: %d/%d, effective_beta: %d, backoff rate: %d%%", beta,
+	     beta_n_conn, beta_effective,
+	     beta_effective * 100 / BICTCP_BETA_SCALE);
+
+	return 0;
+}
+
+static struct ctl_table cubic_spdy_ctl_table[] = {
+	{
+		.procname	= "cubic_spdy_beta",
+		.data		= &beta,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_modify_beta,
+		.extra1		= &zero,
+		.extra2		= &beta_max
+	},
+	{
+		.procname	= "cubic_spdy_beta_n_conn",
+		.data		= &beta_n_conn,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_modify_beta,
+		.extra1		= &zero,
+		.extra2		= &n_max
+	},
+	{ }
+};
+
+
+static struct tcp_congestion_ops cubic_spdy_tcp __read_mostly = {
 	.init		= bictcp_init,
 	.ssthresh	= bictcp_recalc_ssthresh,
 	.cong_avoid	= bictcp_cong_avoid,
@@ -446,13 +522,23 @@ static struct tcp_congestion_ops cubictcp __read_mostly = {
 
 static int __init cubictcp_register(void)
 {
+	int err;
 	BUILD_BUG_ON(sizeof(struct bictcp) > ICSK_CA_PRIV_SIZE);
+	UDBG;
 
 	/* Precompute a bunch of the scaling factors that are used per-packet
 	 * based on SRTT of 100ms
 	 */
 
-	beta_scale = 8*(BICTCP_BETA_SCALE+beta)/ 3 / (BICTCP_BETA_SCALE - beta);
+	beta_effective =
+	    BICTCP_BETA_SCALE - (BICTCP_BETA_SCALE - beta) / beta_n_conn;
+
+	INFO("beta/n: %d/%d, effective_beta: %d, backoff rate: %d%%", beta,
+	     beta_n_conn, beta_effective,
+	     beta_effective * 100 / BICTCP_BETA_SCALE);
+
+	beta_scale = 8 * (BICTCP_BETA_SCALE + beta_effective) / 3 /
+		     (BICTCP_BETA_SCALE - beta_effective);
 
 	cube_rtt_scale = (bic_scale * 10);	/* 1024*c/rtt */
 
@@ -475,12 +561,21 @@ static int __init cubictcp_register(void)
 	/* divide by bic_scale and by constant Srtt (100ms) */
 	do_div(cube_factor, bic_scale * 10);
 
-	return tcp_register_congestion_control(&cubictcp);
+	ctl_hdr = register_net_sysctl(&init_net, "net/ipv4", cubic_spdy_ctl_table);
+	if (ctl_hdr == NULL)
+		return -EINVAL;
+
+	err = tcp_register_congestion_control(&cubic_spdy_tcp);
+	if (err)
+		unregister_net_sysctl_table(ctl_hdr);
+	return err;
 }
 
 static void __exit cubictcp_unregister(void)
 {
-	tcp_unregister_congestion_control(&cubictcp);
+	UDBG;
+	tcp_unregister_congestion_control(&cubic_spdy_tcp);
+	unregister_net_sysctl_table(ctl_hdr);
 }
 
 module_init(cubictcp_register);
